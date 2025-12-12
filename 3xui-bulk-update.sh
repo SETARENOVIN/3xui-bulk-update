@@ -1,28 +1,37 @@
 #!/usr/bin/env bash
-set -u
-set -o pipefail
+set -euo pipefail
 
-# ===========
-# 3x-ui Bulk Update Tool
-# - Extend ExpiryTime (days)
-# - Add totalGB (bytes) by GB
-# - List inbounds and select
-# - CSV report
-# Endpoints (per Postman docs):
-#   POST  /login/                              (cookie session)  5
-#   GET   /panel/api/inbounds/list             6
-#   GET   /panel/api/inbounds/get/{inboundId}  7
-#   POST  /panel/api/inbounds/updateClient/{uuid} with body {id, settings(stringified)} 8
-# ===========
+# ==========================================================
+# 3xui-bulk-update.sh
+# Bulk update clients in a selected inbound (3x-ui)
+#
+# Features:
+# - Mode: extend expiry (days) / add traffic (GB) / both
+# - Fetch and select inbound from /panel/api/inbounds/list
+# - Read clients from inbound settings (JSON string)
+# - Update each client via /panel/api/inbounds/updateClient/{uuid}
+# - Filters: only enabled, expiring within X days, email regex
+# - Dry-run mode
+# - CSV report with OK/FAIL + error messages
+#
+# API endpoints (as commonly used by 3x-ui Postman collections):
+#   POST /login/
+#   GET  /panel/api/inbounds/list
+#   GET  /panel/api/inbounds/get/{inboundId}
+#   POST /panel/api/inbounds/updateClient/{uuid}  body: {id:<inboundId>, settings:"{...}"}
+# ==========================================================
 
-# ---------- utils ----------
-red()    { printf "\033[31m%s\033[0m\n" "$*"; }
-green()  { printf "\033[32m%s\033[0m\n" "$*"; }
-yellow() { printf "\033[33m%s\033[0m\n" "$*"; }
+# ------------------ helpers ------------------
+color() { local c="$1"; shift; printf "\033[%sm%s\033[0m\n" "$c" "$*"; }
+info()  { color "36" "INFO: $*"; }
+ok()    { color "32" "OK:   $*"; }
+warn()  { color "33" "WARN: $*"; }
+fail()  { color "31" "FAIL: $*"; }
 
-need() { command -v "$1" >/dev/null 2>&1 || { red "نیاز به نصب: $1"; exit 1; }; }
+need() { command -v "$1" >/dev/null 2>&1 || { fail "Missing dependency: $1"; exit 1; }; }
 
 read_default() {
+  # read_default "Prompt" "default" var
   local prompt="$1" def="$2" __var="$3"
   local val
   read -r -p "$prompt [$def]: " val
@@ -39,94 +48,79 @@ read_secret() {
 }
 
 now_ms() { echo $(( $(date +%s) * 1000 )); }
-
-bytes_from_gb() {
-  # int GB -> bytes
-  echo $(( $1 * 1024 * 1024 * 1024 ))
-}
-
-gb_from_bytes() {
-  # bytes -> GB (float-ish with 2 decimals via awk)
-  awk -v b="$1" 'BEGIN { printf "%.2f", b/1024/1024/1024 }'
-}
+ms_from_days() { echo $(( $1 * 86400000 )); }
+bytes_from_gb() { echo $(( $1 * 1024 * 1024 * 1024 )); }
+gb_from_bytes() { awk -v b="$1" 'BEGIN { printf "%.2f", b/1024/1024/1024 }'; }
 
 csv_escape() {
-  # Escape CSV field (wrap with quotes, escape quotes)
+  # Wrap in quotes and escape quotes
   local s="$1"
   s="${s//\"/\"\"}"
   printf "\"%s\"" "$s"
 }
 
-# ---------- deps ----------
+# ------------------ deps ------------------
 need curl
 need jq
 need awk
 need base64
+need grep
+need sed
 
-# ---------- config (interactive) ----------
-echo "=== 3x-ui Bulk Update (Expiry / Traffic / Both) ==="
+# ------------------ config prompts ------------------
+echo "=== 3x-ui Bulk Update Tool (Expiry / Traffic / Both) ==="
 echo
 
-read_default "Scheme (http یا https)" "https" SCHEME
-read_default "Host (IP یا domain)" "127.0.0.1" HOST
-read_default "Port" "2053" PORT
-read_default "WEBBASEPATH (مثل /randompath یا خالی)" "" WEBBASEPATH
+read_default "SCHEME (http/https)" "https" SCHEME
+read_default "HOST (IP/domain)" "127.0.0.1" HOST
+read_default "PORT" "2053" PORT
+read_default "WEBBASEPATH (e.g. /randompath or empty)" "" WEBBASEPATH
 
 if [[ -n "$WEBBASEPATH" && "$WEBBASEPATH" != /* ]]; then
   WEBBASEPATH="/$WEBBASEPATH"
 fi
 
-read_default "Allow insecure TLS? (برای سلف‌ساین) y/n" "y" INSECURE_TLS
+read_default "INSECURE_TLS (y/n) (for self-signed certs)" "y" INSECURE_TLS
+read_default "USERNAME" "admin" USERNAME
+read_secret  "PASSWORD" PASSWORD
 
-read_default "Username" "admin" USERNAME
-read_secret  "Password" PASSWORD
-
-read_default "آیا 2FA داری؟ y/n" "n" HAS_2FA
-TWOFA=""
+read_default "HAS_2FA (y/n)" "n" HAS_2FA
+TWO_FACTOR_CODE=""
 if [[ "$HAS_2FA" =~ ^[Yy]$ ]]; then
-  read_default "کد 2FA (six-digit)" "" TWOFA
+  read_default "TWO_FACTOR_CODE" "" TWO_FACTOR_CODE
 fi
 
-read_default "Retry count (curl)" "2" RETRY
-read_default "Timeout seconds" "20" TIMEOUT
+read_default "RETRY (curl retries)" "2" RETRY
+read_default "TIMEOUT (seconds)" "20" TIMEOUT
 
 echo
-echo "عملیات:"
-echo "  1) فقط تمدید انقضا (days)"
-echo "  2) فقط افزایش حجم (GB)"
-echo "  3) هر دو (Expiry + Traffic)"
-read_default "انتخاب (1/2/3)" "1" OP_MODE
+echo "OPERATION_MODE:"
+echo "  1) EXPIRY_ONLY (add days)"
+echo "  2) TRAFFIC_ONLY (add GB)"
+echo "  3) BOTH (expiry + traffic)"
+read_default "Choose (1/2/3)" "1" OP_MODE
 
 ADD_DAYS=0
 ADD_GB=0
+NOEXP_BEHAVIOR="skip"      # skip | setFromNow
+NOQUOTA_BEHAVIOR="skip"    # skip | setLimit
 
 if [[ "$OP_MODE" == "1" || "$OP_MODE" == "3" ]]; then
-  read_default "چند روز به expiryTime اضافه شود؟" "1" ADD_DAYS
-  read_default "اگر expiryTime=0 بود: skip یا setFromNow" "skip" NOEXP_BEHAVIOR
+  read_default "ADD_DAYS (integer)" "1" ADD_DAYS
+  read_default "NOEXP_BEHAVIOR (skip/setFromNow)" "skip" NOEXP_BEHAVIOR
 fi
 
 if [[ "$OP_MODE" == "2" || "$OP_MODE" == "3" ]]; then
-  read_default "چند گیگ به totalGB اضافه شود؟" "10" ADD_GB
-  read_default "اگر totalGB=0 بود: skip یا setLimit" "skip" NOQUOTA_BEHAVIOR
+  read_default "ADD_GB (integer)" "10" ADD_GB
+  read_default "NOQUOTA_BEHAVIOR (skip/setLimit)" "skip" NOQUOTA_BEHAVIOR
 fi
 
 echo
-read_default "فقط کلاینت‌های enable=true اعمال شود؟ y/n" "y" ONLY_ENABLED
-
-echo
-echo "فیلتر اختیاری:"
-echo " - اگر فقط کسانی که تا X روز آینده منقضی می‌شن را هدف بگیری، X را بده."
-echo " - اگر 0 بزنی یعنی بدون فیلتر (همه‌ی کلاینت‌ها)"
-read_default "Expire-within-days (0=همه)" "0" EXPIRE_WITHIN_DAYS
-
-echo
-read_default "فیلتر ایمیل (regex اختیاری، خالی=همه)" "" EMAIL_REGEX
-
-echo
-read_default "Dry-run (فقط نمایش، بدون اعمال) y/n" "y" DRY_RUN
-
-echo
-read_default "مسیر خروجی CSV" "./report.csv" CSV_PATH
+read_default "ONLY_ENABLED (y/n)" "y" ONLY_ENABLED
+read_default "EXPIRE_WITHIN_DAYS (0=all clients)" "0" EXPIRE_WITHIN_DAYS
+read_default "EMAIL_REGEX (empty=all)" "" EMAIL_REGEX
+read_default "DRY_RUN (y/n)" "y" DRY_RUN
+read_default "CSV_PATH" "./report.csv" CSV_PATH
 
 BASE_URL="${SCHEME}://${HOST}:${PORT}${WEBBASEPATH}"
 
@@ -138,11 +132,11 @@ fi
 COOKIE_JAR="$(mktemp)"
 trap 'rm -f "$COOKIE_JAR"' EXIT
 
-# ---------- http helper ----------
+# ------------------ HTTP wrapper ------------------
 api_call() {
   # api_call METHOD URL [JSON_BODY]
   local method="$1" url="$2" body="${3:-}"
-  local resp http_code curl_rc
+  local resp http_code rc
 
   if [[ -n "$body" ]]; then
     set +e
@@ -155,7 +149,7 @@ api_call() {
       -d "$body" \
       -w "\n%{http_code}" \
       "$url")
-    curl_rc=$?
+    rc=$?
     set -e
   else
     set +e
@@ -166,139 +160,120 @@ api_call() {
       -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
       -w "\n%{http_code}" \
       "$url")
-    curl_rc=$?
+    rc=$?
     set -e
   fi
 
   http_code="${resp##*$'\n'}"
   resp="${resp%$'\n'*}"
 
-  echo "$curl_rc" > /tmp/.xui_curl_rc
-  echo "$http_code" > /tmp/.xui_http_code
+  echo "$rc" > /tmp/.xui_rc
+  echo "$http_code" > /tmp/.xui_http
   echo "$resp"
 }
 
-is_success_json() {
-  # returns 0 if .success==true, else 1
-  local body="$1"
-  echo "$body" | jq -e '.success == true' >/dev/null 2>&1
-}
+json_success() { echo "$1" | jq -e '.success == true' >/dev/null 2>&1; }
+json_msg() { echo "$1" | jq -r '.msg // .message // empty' 2>/dev/null || true; }
 
-json_msg() {
-  local body="$1"
-  echo "$body" | jq -r '.msg // .message // empty' 2>/dev/null || true
-}
+# ------------------ CSV init ------------------
+{
+  echo "timestamp,inboundId,email,clientId,oldExpiryMs,newExpiryMs,oldTotalBytes,newTotalBytes,oldTotalGB,newTotalGB,status,httpCode,message"
+} > "$CSV_PATH"
 
-# ---------- login ----------
-echo
-yellow "Login -> ${BASE_URL}/login/"
+# ------------------ login ------------------
+info "Logging in: ${BASE_URL}/login/"
 LOGIN_PAYLOAD=$(jq -n \
   --arg u "$USERNAME" \
   --arg p "$PASSWORD" \
-  --arg tf "$TWOFA" \
+  --arg tf "$TWO_FACTOR_CODE" \
   'if ($tf|length)>0 then {username:$u,password:$p,twoFactorCode:$tf} else {username:$u,password:$p} end')
 
 LOGIN_BODY="$(api_call POST "${BASE_URL}/login/" "$LOGIN_PAYLOAD")"
-LOGIN_HTTP="$(cat /tmp/.xui_http_code)"
-LOGIN_RC="$(cat /tmp/.xui_curl_rc)"
+LOGIN_HTTP="$(cat /tmp/.xui_http)"
+LOGIN_RC="$(cat /tmp/.xui_rc)"
 
 if [[ "$LOGIN_RC" != "0" || "$LOGIN_HTTP" -lt 200 || "$LOGIN_HTTP" -ge 300 ]]; then
-  red "Login failed (curl_rc=$LOGIN_RC http=$LOGIN_HTTP)"
-  red "Response: $LOGIN_BODY"
+  fail "Login failed (curl_rc=$LOGIN_RC http=$LOGIN_HTTP)"
+  fail "Response: $LOGIN_BODY"
+  exit 1
+fi
+ok "Login success (http=$LOGIN_HTTP)"
+
+# ------------------ list inbounds ------------------
+info "Fetching inbounds list..."
+LIST_BODY="$(api_call GET "${BASE_URL}/panel/api/inbounds/list")"
+LIST_HTTP="$(cat /tmp/.xui_http)"
+LIST_RC="$(cat /tmp/.xui_rc)"
+
+if [[ "$LIST_RC" != "0" || "$LIST_HTTP" -lt 200 || "$LIST_HTTP" -ge 300 ]]; then
+  fail "List inbounds failed (curl_rc=$LIST_RC http=$LIST_HTTP)"
+  fail "Response: $LIST_BODY"
   exit 1
 fi
 
-# بعضی نسخه‌ها success را برمی‌گردانند، بعضی نه؛ همین که 2xx باشد و کوکی ست شود کافیست.
-green "Login OK (http=$LOGIN_HTTP)"
-
-# ---------- list inbounds ----------
-echo
-yellow "Fetching inbounds list -> /panel/api/inbounds/list"
-INB_LIST_BODY="$(api_call GET "${BASE_URL}/panel/api/inbounds/list")"
-INB_LIST_HTTP="$(cat /tmp/.xui_http_code)"
-INB_LIST_RC="$(cat /tmp/.xui_curl_rc)"
-
-if [[ "$INB_LIST_RC" != "0" || "$INB_LIST_HTTP" -lt 200 || "$INB_LIST_HTTP" -ge 300 ]]; then
-  red "Failed to list inbounds (curl_rc=$INB_LIST_RC http=$INB_LIST_HTTP)"
-  red "Response: $INB_LIST_BODY"
-  exit 1
-fi
-
-# normalize to array:
-# - sometimes: {success:true, obj:[...]}
-# - sometimes: [...]
-INB_ARR="$(echo "$INB_LIST_BODY" | jq -c 'if type=="array" then . else .obj end')"
-
+INB_ARR="$(echo "$LIST_BODY" | jq -c 'if type=="array" then . else .obj end')"
 COUNT="$(echo "$INB_ARR" | jq 'length')"
+
 if [[ "$COUNT" -eq 0 ]]; then
-  red "هیچ inboundی پیدا نشد."
+  fail "No inbounds found."
   exit 1
 fi
 
 echo
-echo "=== Inbounds (${COUNT}) ==="
+echo "=== INBOUNDS ($COUNT) ==="
 echo "$INB_ARR" | jq -r '
   to_entries[]
   | "\(.key+1)) id=\(.value.id) | remark=\(.value.remark // "-") | protocol=\(.value.protocol // "-") | port=\(.value.port // "-")"
 '
 
-read_default "شماره inbound را انتخاب کن" "1" PICK
+read_default "Select inbound number" "1" PICK
 IDX=$((PICK-1))
 INBOUND_ID="$(echo "$INB_ARR" | jq -r --argjson i "$IDX" '.[$i].id')"
 
 if [[ -z "$INBOUND_ID" || "$INBOUND_ID" == "null" ]]; then
-  red "انتخاب نامعتبر."
+  fail "Invalid selection."
   exit 1
 fi
+ok "Selected inboundId=$INBOUND_ID"
 
-green "Selected inboundId=$INBOUND_ID"
-
-# ---------- get inbound details ----------
-echo
-yellow "Fetching inbound details -> /panel/api/inbounds/get/${INBOUND_ID}"
+# ------------------ get inbound details ------------------
+info "Fetching inbound details..."
 INB_BODY="$(api_call GET "${BASE_URL}/panel/api/inbounds/get/${INBOUND_ID}")"
-INB_HTTP="$(cat /tmp/.xui_http_code)"
-INB_RC="$(cat /tmp/.xui_curl_rc)"
+INB_HTTP="$(cat /tmp/.xui_http)"
+INB_RC="$(cat /tmp/.xui_rc)"
 
 if [[ "$INB_RC" != "0" || "$INB_HTTP" -lt 200 || "$INB_HTTP" -ge 300 ]]; then
-  red "Failed to get inbound (curl_rc=$INB_RC http=$INB_HTTP)"
-  red "Response: $INB_BODY"
+  fail "Get inbound failed (curl_rc=$INB_RC http=$INB_HTTP)"
+  fail "Response: $INB_BODY"
   exit 1
 fi
 
-# settings can be JSON string
-SETTINGS_RAW="$(echo "$INB_BODY" | jq -r '.obj.settings')"
-if [[ -z "$SETTINGS_RAW" || "$SETTINGS_RAW" == "null" ]]; then
-  red "این inbound settings ندارد یا فرمت غیرمنتظره است."
-  red "Response: $INB_BODY"
+SETTINGS_FIELD="$(echo "$INB_BODY" | jq -r '.obj.settings')"
+if [[ -z "$SETTINGS_FIELD" || "$SETTINGS_FIELD" == "null" ]]; then
+  fail "Inbound settings missing/unexpected."
+  fail "Response: $INB_BODY"
   exit 1
 fi
 
+# Parse clients from settings (stringified JSON expected)
 CLIENTS_B64=()
-# Try parse settings as JSON string containing clients
-if echo "$SETTINGS_RAW" | jq -e . >/dev/null 2>&1; then
-  # It's already JSON (rare)
-  mapfile -t CLIENTS_B64 < <(echo "$SETTINGS_RAW" | jq -r '.clients[]? | @base64')
+if echo "$SETTINGS_FIELD" | jq -e . >/dev/null 2>&1; then
+  # already JSON
+  mapfile -t CLIENTS_B64 < <(echo "$SETTINGS_FIELD" | jq -r '.clients[]? | @base64')
 else
-  # It's stringified JSON
-  mapfile -t CLIENTS_B64 < <(echo "$SETTINGS_RAW" | jq -r 'fromjson | .clients[]? | @base64')
+  mapfile -t CLIENTS_B64 < <(echo "$SETTINGS_FIELD" | jq -r 'fromjson | .clients[]? | @base64')
 fi
 
 if [[ "${#CLIENTS_B64[@]}" -eq 0 ]]; then
-  yellow "هیچ کلاینتی در این inbound پیدا نشد."
+  warn "No clients found in this inbound."
   exit 0
 fi
 
-# ---------- CSV header ----------
-{
-  echo "timestamp,inboundId,email,clientId,oldExpiryMs,newExpiryMs,oldTotalBytes,newTotalBytes,oldTotalGB,newTotalGB,status,httpCode,message"
-} > "$CSV_PATH"
-
-# ---------- apply ----------
+# ------------------ derived values ------------------
 NOWMS="$(now_ms)"
-ADD_MS=$(( ADD_DAYS * 86400000 ))
+ADD_MS="$(ms_from_days "$ADD_DAYS")"
 ADD_BYTES="$(bytes_from_gb "$ADD_GB")"
-WINDOW_MS=$(( EXPIRE_WITHIN_DAYS * 86400000 ))
+WINDOW_MS="$(ms_from_days "$EXPIRE_WITHIN_DAYS")"
 
 TOTAL=0
 UPDATED=0
@@ -306,8 +281,11 @@ SKIPPED=0
 FAILED=0
 
 echo
-echo "=== Clients: ${#CLIENTS_B64[@]} ==="
+info "Clients found: ${#CLIENTS_B64[@]}"
+info "DRY_RUN=$DRY_RUN | ONLY_ENABLED=$ONLY_ENABLED | EXPIRE_WITHIN_DAYS=$EXPIRE_WITHIN_DAYS | EMAIL_REGEX='${EMAIL_REGEX}'"
+echo
 
+# ------------------ process clients ------------------
 for row in "${CLIENTS_B64[@]}"; do
   TOTAL=$((TOTAL+1))
 
@@ -315,17 +293,12 @@ for row in "${CLIENTS_B64[@]}"; do
 
   email="$(echo "$c" | jq -r '.email // ""')"
   enable="$(echo "$c" | jq -r '.enable // true')"
-  uuid="$(echo "$c" | jq -r '.id // empty')" # updateClient expects {uuid} in path 9
 
-  if [[ -z "$uuid" ]]; then
-    # If no id exists (unusual for vmess/vless), try password as fallback
-    uuid="$(echo "$c" | jq -r '.password // empty')"
-  fi
-
-  if [[ -z "$uuid" ]]; then
-    # last resort: email
-    uuid="$email"
-  fi
+  # client identifier for update endpoint path:
+  # prefer .id (uuid), else .password (trojan), else email
+  client_id="$(echo "$c" | jq -r '.id // empty')"
+  [[ -z "$client_id" ]] && client_id="$(echo "$c" | jq -r '.password // empty')"
+  [[ -z "$client_id" ]] && client_id="$email"
 
   # filters
   if [[ "$ONLY_ENABLED" =~ ^[Yy]$ ]] && [[ "$enable" != "true" ]]; then
@@ -342,130 +315,117 @@ for row in "${CLIENTS_B64[@]}"; do
     fi
   fi
 
-  oldExp="$(echo "$c" | jq -r '.expiryTime // 0')"
-  oldTot="$(echo "$c" | jq -r '.totalGB // 0')"
+  old_exp="$(echo "$c" | jq -r '.expiryTime // 0')"
+  old_tot="$(echo "$c" | jq -r '.totalGB // 0')"
 
-  newExp="$oldExp"
-  newTot="$oldTot"
+  new_exp="$old_exp"
+  new_tot="$old_tot"
 
-  # expiry filter (only if user asked and expiry is part of operation OR you explicitly want filter anyway)
-  if [[ "$EXPIRE_WITHIN_DAYS" -gt 0 ]]; then
-    # If expiryTime==0 (no-expiry), it's not "expiring soon"
-    if [[ "$oldExp" -eq 0 ]]; then
-      # keep as-is, but still can be modified if user chose setFromNow
-      :
-    else
-      if [[ "$oldExp" -gt $((NOWMS + WINDOW_MS)) ]]; then
-        # not within window
-        SKIPPED=$((SKIPPED+1))
-        echo "SKIP(not-in-window): $email"
-        continue
-      fi
+  # expire-within filter (only meaningful if expiryTime != 0)
+  if [[ "$EXPIRE_WITHIN_DAYS" -gt 0 && "$old_exp" -ne 0 ]]; then
+    if [[ "$old_exp" -gt $((NOWMS + WINDOW_MS)) ]]; then
+      SKIPPED=$((SKIPPED+1))
+      echo "SKIP(not-within-window): $email"
+      continue
     fi
   fi
 
-  # apply expiry
+  # apply expiry change
   if [[ "$OP_MODE" == "1" || "$OP_MODE" == "3" ]]; then
-    if [[ "$oldExp" -eq 0 ]]; then
-      if [[ "${NOEXP_BEHAVIOR}" == "setFromNow" ]]; then
-        newExp=$((NOWMS + ADD_MS))
+    if [[ "$old_exp" -eq 0 ]]; then
+      if [[ "$NOEXP_BEHAVIOR" == "setFromNow" ]]; then
+        new_exp=$((NOWMS + ADD_MS))
       else
-        # skip expiry change
-        newExp="$oldExp"
+        new_exp="$old_exp"
       fi
     else
-      newExp=$((oldExp + ADD_MS))
+      new_exp=$((old_exp + ADD_MS))
     fi
   fi
 
-  # apply traffic
+  # apply traffic change
   if [[ "$OP_MODE" == "2" || "$OP_MODE" == "3" ]]; then
-    if [[ "$oldTot" -eq 0 ]]; then
-      if [[ "${NOQUOTA_BEHAVIOR}" == "setLimit" ]]; then
-        newTot="$ADD_BYTES"
+    if [[ "$old_tot" -eq 0 ]]; then
+      if [[ "$NOQUOTA_BEHAVIOR" == "setLimit" ]]; then
+        new_tot="$ADD_BYTES"
       else
-        newTot="$oldTot"
+        new_tot="$old_tot"
       fi
     else
-      newTot=$((oldTot + ADD_BYTES))
+      new_tot=$((old_tot + ADD_BYTES))
     fi
   fi
 
-  # if nothing changes, skip
-  if [[ "$newExp" -eq "$oldExp" && "$newTot" -eq "$oldTot" ]]; then
+  if [[ "$new_exp" -eq "$old_exp" && "$new_tot" -eq "$old_tot" ]]; then
     SKIPPED=$((SKIPPED+1))
     echo "SKIP(no-change): $email"
     continue
   fi
 
-  # build new client object
-  newClient="$c"
-  if [[ "$newExp" -ne "$oldExp" ]]; then
-    newClient="$(echo "$newClient" | jq --argjson v "$newExp" '.expiryTime = $v')"
+  # build updated client object
+  new_client="$c"
+  if [[ "$new_exp" -ne "$old_exp" ]]; then
+    new_client="$(echo "$new_client" | jq --argjson v "$new_exp" '.expiryTime = $v')"
   fi
-  if [[ "$newTot" -ne "$oldTot" ]]; then
-    newClient="$(echo "$newClient" | jq --argjson v "$newTot" '.totalGB = $v')"
+  if [[ "$new_tot" -ne "$old_tot" ]]; then
+    new_client="$(echo "$new_client" | jq --argjson v "$new_tot" '.totalGB = $v')"
   fi
 
-  # update payload per common pattern: { id: inboundId, settings: JSON.stringify({clients:[client]}) } 10
-  settings_obj="$(jq -n --argjson cl "$newClient" '{clients:[$cl]}')"
+  # settings must be a STRING with JSON content: {"clients":[{...}]} for updateClient
+  settings_obj="$(jq -n --argjson cl "$new_client" '{clients:[$cl]}')"
   settings_str="$(echo "$settings_obj" | jq -c '.')"
 
-  update_body="$(jq -n --argjson id "$INBOUND_ID" --arg settings "$settings_str" '{id:$id, settings:$settings}')"
+  update_payload="$(jq -n --argjson id "$INBOUND_ID" --arg settings "$settings_str" '{id:$id, settings:$settings}')"
+
+  old_gb="$(gb_from_bytes "$old_tot")"
+  new_gb="$(gb_from_bytes "$new_tot")"
 
   if [[ "$DRY_RUN" =~ ^[Yy]$ ]]; then
-    echo "DRY: $email | expiry: $oldExp -> $newExp | total: $(gb_from_bytes "$oldTot")GB -> $(gb_from_bytes "$newTot")GB"
+    echo "DRY: $email | expiry: $old_exp -> $new_exp | totalGB: $old_gb -> $new_gb"
     UPDATED=$((UPDATED+1))
-    {
-      ts="$(date -Iseconds)"
-      echo "$(csv_escape "$ts"),$INBOUND_ID,$(csv_escape "$email"),$(csv_escape "$uuid"),$oldExp,$newExp,$oldTot,$newTot,$(gb_from_bytes "$oldTot"),$(gb_from_bytes "$newTot"),DRY,0,$(csv_escape "")"
-    } >> "$CSV_PATH"
+    ts="$(date -Iseconds)"
+    echo "$(csv_escape "$ts"),$INBOUND_ID,$(csv_escape "$email"),$(csv_escape "$client_id"),$old_exp,$new_exp,$old_tot,$new_tot,$old_gb,$new_gb,DRY,0,$(csv_escape "")" >> "$CSV_PATH"
     continue
   fi
 
-  # POST /panel/api/inbounds/updateClient/{uuid} 11
-  resp="$(api_call POST "${BASE_URL}/panel/api/inbounds/updateClient/${uuid}" "$update_body")"
-  http="$(cat /tmp/.xui_http_code)"
-  rc="$(cat /tmp/.xui_curl_rc)"
+  # call update
+  resp="$(api_call POST "${BASE_URL}/panel/api/inbounds/updateClient/${client_id}" "$update_payload")"
+  http="$(cat /tmp/.xui_http)"
+  rc="$(cat /tmp/.xui_rc)"
 
   status="FAIL"
-  msg=""
+  message=""
 
   if [[ "$rc" != "0" ]]; then
-    msg="curl_rc=$rc"
+    message="curl_rc=$rc"
   elif [[ "$http" -lt 200 || "$http" -ge 300 ]]; then
-    msg="http=$http body=$resp"
+    message="http=$http body=$resp"
   else
-    if is_success_json "$resp"; then
+    if json_success "$resp"; then
       status="OK"
     else
-      # some responses may not contain success, try accept 2xx but log body
-      # prefer explicit success
-      status="FAIL"
-      msg="$(json_msg "$resp")"
-      [[ -z "$msg" ]] && msg="unexpected response: $resp"
+      message="$(json_msg "$resp")"
+      [[ -z "$message" ]] && message="unexpected response: $resp"
     fi
   fi
 
+  ts="$(date -Iseconds)"
+  echo "$(csv_escape "$ts"),$INBOUND_ID,$(csv_escape "$email"),$(csv_escape "$client_id"),$old_exp,$new_exp,$old_tot,$new_tot,$old_gb,$new_gb,$status,$http,$(csv_escape "$message")" >> "$CSV_PATH"
+
   if [[ "$status" == "OK" ]]; then
-    green "OK: $email | expiry: $oldExp -> $newExp | total: $(gb_from_bytes "$oldTot")GB -> $(gb_from_bytes "$newTot")GB"
+    ok "$email | expiry: $old_exp -> $new_exp | totalGB: $old_gb -> $new_gb"
     UPDATED=$((UPDATED+1))
   else
-    red "FAIL: $email | $msg"
+    fail "$email | $message"
     FAILED=$((FAILED+1))
   fi
-
-  {
-    ts="$(date -Iseconds)"
-    echo "$(csv_escape "$ts"),$INBOUND_ID,$(csv_escape "$email"),$(csv_escape "$uuid"),$oldExp,$newExp,$oldTot,$newTot,$(gb_from_bytes "$oldTot"),$(gb_from_bytes "$newTot"),$status,$http,$(csv_escape "$msg")"
-  } >> "$CSV_PATH"
-
 done
 
 echo
-echo "=== Summary ==="
-echo "Total:   $TOTAL"
-echo "Updated: $UPDATED"
-echo "Skipped: $SKIPPED"
-echo "Failed:  $FAILED"
-echo "CSV:     $CSV_PATH"
+echo "=== SUMMARY ==="
+echo "TOTAL   : $TOTAL"
+echo "UPDATED : $UPDATED"
+echo "SKIPPED : $SKIPPED"
+echo "FAILED  : $FAILED"
+echo "CSV     : $CSV_PATH"
+ok "Done."
