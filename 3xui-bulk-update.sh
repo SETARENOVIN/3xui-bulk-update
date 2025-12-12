@@ -2,23 +2,14 @@
 set -euo pipefail
 
 # ==========================================================
-# 3xui-bulk-update.sh
-# Bulk update clients in a selected inbound (3x-ui)
-#
-# Features:
-# - Mode: extend expiry (days) / add traffic (GB) / both
-# - Fetch and select inbound from /panel/api/inbounds/list
-# - Read clients from inbound settings (JSON string)
-# - Update each client via /panel/api/inbounds/updateClient/{uuid}
+# 3xui-bulk-update.sh (Interactive)
+# - Single PANEL_URL input (e.g. https://panel.example.com:2053/network/aaa)
+# - Progress + ETA (no per-client change logs)
+# - Modes: expiry / traffic / both
 # - Filters: only enabled, expiring within X days, email regex
 # - Dry-run mode
-# - CSV report with OK/FAIL + error messages
-#
-# API endpoints (as commonly used by 3x-ui Postman collections):
-#   POST /login/
-#   GET  /panel/api/inbounds/list
-#   GET  /panel/api/inbounds/get/{inboundId}
-#   POST /panel/api/inbounds/updateClient/{uuid}  body: {id:<inboundId>, settings:"{...}"}
+# - CSV report (OK/FAIL/DRY + messages)
+# - Redirect-safe login (handles 307/301/302/303)
 # ==========================================================
 
 # ------------------ helpers ------------------
@@ -31,7 +22,6 @@ fail()  { color "31" "FAIL: $*"; }
 need() { command -v "$1" >/dev/null 2>&1 || { fail "Missing dependency: $1"; exit 1; }; }
 
 read_default() {
-  # read_default "Prompt" "default" var
   local prompt="$1" def="$2" __var="$3"
   local val
   read -r -p "$prompt [$def]: " val
@@ -47,16 +37,31 @@ read_secret() {
   printf -v "$__var" "%s" "$val"
 }
 
+trim_trailing_slash() {
+  local s="$1"
+  # remove trailing slashes
+  while [[ "$s" == */ ]]; do s="${s%/}"; done
+  printf "%s" "$s"
+}
+
 now_ms() { echo $(( $(date +%s) * 1000 )); }
 ms_from_days() { echo $(( $1 * 86400000 )); }
 bytes_from_gb() { echo $(( $1 * 1024 * 1024 * 1024 )); }
 gb_from_bytes() { awk -v b="$1" 'BEGIN { printf "%.2f", b/1024/1024/1024 }'; }
 
 csv_escape() {
-  # Wrap in quotes and escape quotes
   local s="$1"
   s="${s//\"/\"\"}"
   printf "\"%s\"" "$s"
+}
+
+fmt_hms() {
+  local s="$1"
+  if [[ "$s" -lt 0 ]]; then s=0; fi
+  local h=$((s/3600))
+  local m=$(( (s%3600)/60 ))
+  local sec=$((s%60))
+  printf "%02d:%02d:%02d" "$h" "$m" "$sec"
 }
 
 # ------------------ deps ------------------
@@ -65,20 +70,13 @@ need jq
 need awk
 need base64
 need grep
-need sed
 
 # ------------------ config prompts ------------------
-echo "=== 3x-ui Bulk Update Tool (Expiry / Traffic / Both) ==="
+echo "=== 3x-ui Bulk Update Tool (Progress + ETA) ==="
 echo
 
-read_default "SCHEME (http/https)" "https" SCHEME
-read_default "HOST (IP/domain)" "127.0.0.1" HOST
-read_default "PORT" "2053" PORT
-read_default "WEBBASEPATH (e.g. /randompath or empty)" "" WEBBASEPATH
-
-if [[ -n "$WEBBASEPATH" && "$WEBBASEPATH" != /* ]]; then
-  WEBBASEPATH="/$WEBBASEPATH"
-fi
+read_default "PANEL_URL (e.g. https://panel.dlcloud.ir:2053/network/aaa)" "https://panel.dlcloud.ir:2053/network/aaa" PANEL_URL
+PANEL_URL="$(trim_trailing_slash "$PANEL_URL")"
 
 read_default "INSECURE_TLS (y/n) (for self-signed certs)" "y" INSECURE_TLS
 read_default "USERNAME" "admin" USERNAME
@@ -122,8 +120,6 @@ read_default "EMAIL_REGEX (empty=all)" "" EMAIL_REGEX
 read_default "DRY_RUN (y/n)" "y" DRY_RUN
 read_default "CSV_PATH" "./report.csv" CSV_PATH
 
-BASE_URL="${SCHEME}://${HOST}:${PORT}${WEBBASEPATH}"
-
 CURL_INSECURE=()
 if [[ "$INSECURE_TLS" =~ ^[Yy]$ ]]; then
   CURL_INSECURE=(-k)
@@ -141,6 +137,7 @@ api_call() {
   if [[ -n "$body" ]]; then
     set +e
     resp=$(curl -sS "${CURL_INSECURE[@]}" \
+      --location --max-redirs 5 --post301 --post302 --post303 \
       --retry "$RETRY" --retry-delay 1 \
       --max-time "$TIMEOUT" \
       -X "$method" \
@@ -154,6 +151,7 @@ api_call() {
   else
     set +e
     resp=$(curl -sS "${CURL_INSECURE[@]}" \
+      --location --max-redirs 5 --post301 --post302 --post303 \
       --retry "$RETRY" --retry-delay 1 \
       --max-time "$TIMEOUT" \
       -X "$method" \
@@ -180,17 +178,25 @@ json_msg() { echo "$1" | jq -r '.msg // .message // empty' 2>/dev/null || true; 
   echo "timestamp,inboundId,email,clientId,oldExpiryMs,newExpiryMs,oldTotalBytes,newTotalBytes,oldTotalGB,newTotalGB,status,httpCode,message"
 } > "$CSV_PATH"
 
-# ------------------ login ------------------
-info "Logging in: ${BASE_URL}/login"
+# ------------------ login (tries /login and /login/) ------------------
 LOGIN_PAYLOAD=$(jq -n \
   --arg u "$USERNAME" \
   --arg p "$PASSWORD" \
   --arg tf "$TWO_FACTOR_CODE" \
   'if ($tf|length)>0 then {username:$u,password:$p,twoFactorCode:$tf} else {username:$u,password:$p} end')
 
-LOGIN_BODY="$(api_call POST "${BASE_URL}/login" "$LOGIN_PAYLOAD")"
+info "Logging in: ${PANEL_URL}/login"
+LOGIN_BODY="$(api_call POST "${PANEL_URL}/login" "$LOGIN_PAYLOAD")"
 LOGIN_HTTP="$(cat /tmp/.xui_http)"
 LOGIN_RC="$(cat /tmp/.xui_rc)"
+
+if [[ "$LOGIN_RC" != "0" || "$LOGIN_HTTP" -lt 200 || "$LOGIN_HTTP" -ge 300 ]]; then
+  # fallback to /login/
+  warn "Login failed on /login (curl_rc=$LOGIN_RC http=$LOGIN_HTTP). Trying /login/ ..."
+  LOGIN_BODY="$(api_call POST "${PANEL_URL}/login/" "$LOGIN_PAYLOAD")"
+  LOGIN_HTTP="$(cat /tmp/.xui_http)"
+  LOGIN_RC="$(cat /tmp/.xui_rc)"
+fi
 
 if [[ "$LOGIN_RC" != "0" || "$LOGIN_HTTP" -lt 200 || "$LOGIN_HTTP" -ge 300 ]]; then
   fail "Login failed (curl_rc=$LOGIN_RC http=$LOGIN_HTTP)"
@@ -201,7 +207,7 @@ ok "Login success (http=$LOGIN_HTTP)"
 
 # ------------------ list inbounds ------------------
 info "Fetching inbounds list..."
-LIST_BODY="$(api_call GET "${BASE_URL}/panel/api/inbounds/list")"
+LIST_BODY="$(api_call GET "${PANEL_URL}/panel/api/inbounds/list")"
 LIST_HTTP="$(cat /tmp/.xui_http)"
 LIST_RC="$(cat /tmp/.xui_rc)"
 
@@ -213,7 +219,6 @@ fi
 
 INB_ARR="$(echo "$LIST_BODY" | jq -c 'if type=="array" then . else .obj end')"
 COUNT="$(echo "$INB_ARR" | jq 'length')"
-
 if [[ "$COUNT" -eq 0 ]]; then
   fail "No inbounds found."
   exit 1
@@ -229,7 +234,6 @@ echo "$INB_ARR" | jq -r '
 read_default "Select inbound number" "1" PICK
 IDX=$((PICK-1))
 INBOUND_ID="$(echo "$INB_ARR" | jq -r --argjson i "$IDX" '.[$i].id')"
-
 if [[ -z "$INBOUND_ID" || "$INBOUND_ID" == "null" ]]; then
   fail "Invalid selection."
   exit 1
@@ -238,7 +242,7 @@ ok "Selected inboundId=$INBOUND_ID"
 
 # ------------------ get inbound details ------------------
 info "Fetching inbound details..."
-INB_BODY="$(api_call GET "${BASE_URL}/panel/api/inbounds/get/${INBOUND_ID}")"
+INB_BODY="$(api_call GET "${PANEL_URL}/panel/api/inbounds/get/${INBOUND_ID}")"
 INB_HTTP="$(cat /tmp/.xui_http)"
 INB_RC="$(cat /tmp/.xui_rc)"
 
@@ -255,10 +259,8 @@ if [[ -z "$SETTINGS_FIELD" || "$SETTINGS_FIELD" == "null" ]]; then
   exit 1
 fi
 
-# Parse clients from settings (stringified JSON expected)
 CLIENTS_B64=()
 if echo "$SETTINGS_FIELD" | jq -e . >/dev/null 2>&1; then
-  # already JSON
   mapfile -t CLIENTS_B64 < <(echo "$SETTINGS_FIELD" | jq -r '.clients[]? | @base64')
 else
   mapfile -t CLIENTS_B64 < <(echo "$SETTINGS_FIELD" | jq -r 'fromjson | .clients[]? | @base64')
@@ -279,23 +281,62 @@ TOTAL=0
 UPDATED=0
 SKIPPED=0
 FAILED=0
+PROCESSED=0
+
+# Keep a short sample of error messages (no spam)
+ERROR_SAMPLE=()
+ERROR_SAMPLE_MAX=5
+
+# progress throttle
+START_TS="$(date +%s)"
+LAST_DRAW_TS=0
+
+draw_progress() {
+  local force="${1:-0}"
+  local now="$(date +%s)"
+  local elapsed=$((now - START_TS))
+  local pct=0
+  if [[ "$TOTAL" -gt 0 ]]; then
+    pct=$(( (PROCESSED * 100) / TOTAL ))
+  fi
+
+  local eta="--:--:--"
+  if [[ "$PROCESSED" -gt 0 && "$elapsed" -gt 0 ]]; then
+    # avg per item
+    local rate_num="$PROCESSED"
+    local rate_den="$elapsed"
+    # remaining seconds = elapsed/proc * (total-proc)
+    local remaining=$(( (elapsed * (TOTAL - PROCESSED)) / PROCESSED ))
+    eta="$(fmt_hms "$remaining")"
+  fi
+
+  # throttle to 1 update/sec unless forced
+  if [[ "$force" -eq 0 ]]; then
+    if [[ "$now" -le "$LAST_DRAW_TS" ]]; then
+      return
+    fi
+    LAST_DRAW_TS="$now"
+  fi
+
+  printf "\rProgress: %3d%% (%d/%d) | OK:%d FAIL:%d SKIP:%d | ETA:%s" \
+    "$pct" "$PROCESSED" "$TOTAL" "$UPDATED" "$FAILED" "$SKIPPED" "$eta"
+}
 
 echo
 info "Clients found: ${#CLIENTS_B64[@]}"
 info "DRY_RUN=$DRY_RUN | ONLY_ENABLED=$ONLY_ENABLED | EXPIRE_WITHIN_DAYS=$EXPIRE_WITHIN_DAYS | EMAIL_REGEX='${EMAIL_REGEX}'"
 echo
 
+TOTAL="${#CLIENTS_B64[@]}"
+draw_progress 1
+
 # ------------------ process clients ------------------
 for row in "${CLIENTS_B64[@]}"; do
-  TOTAL=$((TOTAL+1))
-
   c="$(echo "$row" | base64 -d)"
 
   email="$(echo "$c" | jq -r '.email // ""')"
   enable="$(echo "$c" | jq -r '.enable // true')"
 
-  # client identifier for update endpoint path:
-  # prefer .id (uuid), else .password (trojan), else email
   client_id="$(echo "$c" | jq -r '.id // empty')"
   [[ -z "$client_id" ]] && client_id="$(echo "$c" | jq -r '.password // empty')"
   [[ -z "$client_id" ]] && client_id="$email"
@@ -303,14 +344,16 @@ for row in "${CLIENTS_B64[@]}"; do
   # filters
   if [[ "$ONLY_ENABLED" =~ ^[Yy]$ ]] && [[ "$enable" != "true" ]]; then
     SKIPPED=$((SKIPPED+1))
-    echo "SKIP(disabled): $email"
+    PROCESSED=$((PROCESSED+1))
+    draw_progress
     continue
   fi
 
   if [[ -n "$EMAIL_REGEX" ]]; then
     if ! echo "$email" | grep -Eiq "$EMAIL_REGEX"; then
       SKIPPED=$((SKIPPED+1))
-      echo "SKIP(regex): $email"
+      PROCESSED=$((PROCESSED+1))
+      draw_progress
       continue
     fi
   fi
@@ -321,16 +364,17 @@ for row in "${CLIENTS_B64[@]}"; do
   new_exp="$old_exp"
   new_tot="$old_tot"
 
-  # expire-within filter (only meaningful if expiryTime != 0)
+  # expire-within filter
   if [[ "$EXPIRE_WITHIN_DAYS" -gt 0 && "$old_exp" -ne 0 ]]; then
     if [[ "$old_exp" -gt $((NOWMS + WINDOW_MS)) ]]; then
       SKIPPED=$((SKIPPED+1))
-      echo "SKIP(not-within-window): $email"
+      PROCESSED=$((PROCESSED+1))
+      draw_progress
       continue
     fi
   fi
 
-  # apply expiry change
+  # apply expiry
   if [[ "$OP_MODE" == "1" || "$OP_MODE" == "3" ]]; then
     if [[ "$old_exp" -eq 0 ]]; then
       if [[ "$NOEXP_BEHAVIOR" == "setFromNow" ]]; then
@@ -343,7 +387,7 @@ for row in "${CLIENTS_B64[@]}"; do
     fi
   fi
 
-  # apply traffic change
+  # apply traffic
   if [[ "$OP_MODE" == "2" || "$OP_MODE" == "3" ]]; then
     if [[ "$old_tot" -eq 0 ]]; then
       if [[ "$NOQUOTA_BEHAVIOR" == "setLimit" ]]; then
@@ -358,7 +402,8 @@ for row in "${CLIENTS_B64[@]}"; do
 
   if [[ "$new_exp" -eq "$old_exp" && "$new_tot" -eq "$old_tot" ]]; then
     SKIPPED=$((SKIPPED+1))
-    echo "SKIP(no-change): $email"
+    PROCESSED=$((PROCESSED+1))
+    draw_progress
     continue
   fi
 
@@ -371,25 +416,24 @@ for row in "${CLIENTS_B64[@]}"; do
     new_client="$(echo "$new_client" | jq --argjson v "$new_tot" '.totalGB = $v')"
   fi
 
-  # settings must be a STRING with JSON content: {"clients":[{...}]} for updateClient
   settings_obj="$(jq -n --argjson cl "$new_client" '{clients:[$cl]}')"
   settings_str="$(echo "$settings_obj" | jq -c '.')"
-
   update_payload="$(jq -n --argjson id "$INBOUND_ID" --arg settings "$settings_str" '{id:$id, settings:$settings}')"
 
   old_gb="$(gb_from_bytes "$old_tot")"
   new_gb="$(gb_from_bytes "$new_tot")"
 
+  ts="$(date -Iseconds)"
+
   if [[ "$DRY_RUN" =~ ^[Yy]$ ]]; then
-    echo "DRY: $email | expiry: $old_exp -> $new_exp | totalGB: $old_gb -> $new_gb"
     UPDATED=$((UPDATED+1))
-    ts="$(date -Iseconds)"
     echo "$(csv_escape "$ts"),$INBOUND_ID,$(csv_escape "$email"),$(csv_escape "$client_id"),$old_exp,$new_exp,$old_tot,$new_tot,$old_gb,$new_gb,DRY,0,$(csv_escape "")" >> "$CSV_PATH"
+    PROCESSED=$((PROCESSED+1))
+    draw_progress
     continue
   fi
 
-  # call update
-  resp="$(api_call POST "${BASE_URL}/panel/api/inbounds/updateClient/${client_id}" "$update_payload")"
+  resp="$(api_call POST "${PANEL_URL}/panel/api/inbounds/updateClient/${client_id}" "$update_payload")"
   http="$(cat /tmp/.xui_http)"
   rc="$(cat /tmp/.xui_rc)"
 
@@ -409,23 +453,40 @@ for row in "${CLIENTS_B64[@]}"; do
     fi
   fi
 
-  ts="$(date -Iseconds)"
-  echo "$(csv_escape "$ts"),$INBOUND_ID,$(csv_escape "$email"),$(csv_escape "$client_id"),$old_exp,$new_exp,$old_tot,$new_tot,$old_gb,$new_gb,$status,$http,$(csv_escape "$message")" >> "$CSV_PATH"
-
   if [[ "$status" == "OK" ]]; then
-    ok "$email | expiry: $old_exp -> $new_exp | totalGB: $old_gb -> $new_gb"
     UPDATED=$((UPDATED+1))
   else
-    fail "$email | $message"
     FAILED=$((FAILED+1))
+    if [[ "${#ERROR_SAMPLE[@]}" -lt "$ERROR_SAMPLE_MAX" ]]; then
+      ERROR_SAMPLE+=("$email | $message")
+    fi
   fi
+
+  echo "$(csv_escape "$ts"),$INBOUND_ID,$(csv_escape "$email"),$(csv_escape "$client_id"),$old_exp,$new_exp,$old_tot,$new_tot,$old_gb,$new_gb,$status,$http,$(csv_escape "$message")" >> "$CSV_PATH"
+
+  PROCESSED=$((PROCESSED+1))
+  draw_progress
 done
 
+# final progress line + newline
+draw_progress 1
 echo
+echo
+
 echo "=== SUMMARY ==="
 echo "TOTAL   : $TOTAL"
 echo "UPDATED : $UPDATED"
 echo "SKIPPED : $SKIPPED"
 echo "FAILED  : $FAILED"
 echo "CSV     : $CSV_PATH"
+
+if [[ "$FAILED" -gt 0 ]]; then
+  echo
+  warn "Some requests failed. See CSV for full details."
+  warn "Error sample (up to $ERROR_SAMPLE_MAX):"
+  for e in "${ERROR_SAMPLE[@]}"; do
+    echo "  - $e"
+  done
+fi
+
 ok "Done."
