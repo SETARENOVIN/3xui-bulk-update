@@ -181,14 +181,14 @@ json_msg() { echo "$1" | jq -r '.msg // .message // empty' 2>/dev/null || true; 
 } > "$CSV_PATH"
 
 # ------------------ login ------------------
-info "Logging in: ${BASE_URL}/login/"
+info "Logging in: ${BASE_URL}/login"
 LOGIN_PAYLOAD=$(jq -n \
   --arg u "$USERNAME" \
   --arg p "$PASSWORD" \
   --arg tf "$TWO_FACTOR_CODE" \
   'if ($tf|length)>0 then {username:$u,password:$p,twoFactorCode:$tf} else {username:$u,password:$p} end')
 
-LOGIN_BODY="$(api_call POST "${BASE_URL}/login/" "$LOGIN_PAYLOAD")"
+LOGIN_BODY="$(api_call POST "${BASE_URL}/login" "$LOGIN_PAYLOAD")"
 LOGIN_HTTP="$(cat /tmp/.xui_http)"
 LOGIN_RC="$(cat /tmp/.xui_rc)"
 
