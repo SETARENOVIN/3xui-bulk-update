@@ -10,7 +10,7 @@ set -euo pipefail
 # - Filters: ONLY_ENABLED, EXPIRE_WITHIN_DAYS, EMAIL_REGEX
 # - Progress + ETA only (no per-client logs)
 # - No CSV
-# - Handles settings as string OR object
+# - settings can be string OR object
 # - Auto retry/backoff on "database is locked"
 # ==========================================================
 
@@ -63,13 +63,18 @@ fmt_hms(){
   printf "%02d:%02d:%02d" $((s/3600)) $(((s%3600)/60)) $((s%60))
 }
 
-# -------- HTTP session --------
+json_success(){ echo "$1" | jq -e '.success==true' >/dev/null 2>&1; }
+json_msg(){ echo "$1" | jq -r '.msg // .message // empty' 2>/dev/null || true; }
+
+# -------- temp/session --------
 COOKIE_JAR="$(mktemp)"
-trap 'rm -f "$COOKIE_JAR"' EXIT
+TMP_DIR="$(mktemp -d)"
+trap 'rm -f "$COOKIE_JAR"; rm -rf "$TMP_DIR"' EXIT
 
-API_RC=0
-API_HTTP=0
+HTTP_FILE="$TMP_DIR/http"
+RC_FILE="$TMP_DIR/rc"
 
+# -------- HTTP wrapper (writes http/rc to temp files) --------
 api_call(){
   # api_call METHOD URL [JSON_BODY]
   local method="$1" url="$2" body="${3:-}"
@@ -104,13 +109,11 @@ api_call(){
   http="${resp##*$'\n'}"
   resp="${resp%$'\n'*}"
 
-  API_RC="$rc"
-  API_HTTP="$http"
+  echo "$http" > "$HTTP_FILE"
+  echo "$rc"   > "$RC_FILE"
+
   printf "%s" "$resp"
 }
-
-json_success(){ echo "$1" | jq -e '.success==true' >/dev/null 2>&1; }
-json_msg(){ echo "$1" | jq -r '.msg // .message // empty' 2>/dev/null || true; }
 
 # -------- prompts --------
 echo "=== 3x-ui Bulk Update (Progress + ETA) ==="
@@ -165,19 +168,28 @@ LOGIN_PAYLOAD=$(jq -n --arg u "$USERNAME" --arg p "$PASSWORD" --arg tf "$TWOFA" 
 echo
 echo "INFO: Logging in..."
 BODY="$(api_call POST "${PANEL_URL}/login" "$LOGIN_PAYLOAD")"
-if [[ "$API_RC" != "0" || "$API_HTTP" -lt 200 || "$API_HTTP" -ge 300 ]]; then
+HTTP="$(cat "$HTTP_FILE")"; RC="$(cat "$RC_FILE")"
+if [[ "$RC" != "0" || "$HTTP" -lt 200 || "$HTTP" -ge 300 ]]; then
   BODY="$(api_call POST "${PANEL_URL}/login/" "$LOGIN_PAYLOAD")"
+  HTTP="$(cat "$HTTP_FILE")"; RC="$(cat "$RC_FILE")"
 fi
-if [[ "$API_RC" != "0" || "$API_HTTP" -lt 200 || "$API_HTTP" -ge 300 ]]; then
-  echo "FAIL: Login failed (curl_rc=$API_RC http=$API_HTTP)"
-  echo "FAIL: Response: $BODY"
-  exit 1
+
+# If body says success:true, treat as OK even if proxy gives odd code
+if ! { [[ "$RC" == "0" && "$HTTP" -ge 200 && "$HTTP" -lt 300 ]]; } ; then
+  if echo "$BODY" | jq -e '.success==true' >/dev/null 2>&1; then
+    echo "WARN: Login http/rc looked odd (rc=$RC http=$HTTP) but success=true. Continuing..."
+  else
+    echo "FAIL: Login failed (curl_rc=$RC http=$HTTP)"
+    echo "FAIL: Response: $BODY"
+    exit 1
+  fi
 fi
 
 # -------- list inbounds --------
 LIST="$(api_call GET "${PANEL_URL}/panel/api/inbounds/list")"
-if [[ "$API_RC" != "0" || "$API_HTTP" -lt 200 || "$API_HTTP" -ge 300 ]]; then
-  echo "FAIL: inbounds/list (curl_rc=$API_RC http=$API_HTTP)"
+HTTP="$(cat "$HTTP_FILE")"; RC="$(cat "$RC_FILE")"
+if [[ "$RC" != "0" || "$HTTP" -lt 200 || "$HTTP" -ge 300 ]]; then
+  echo "FAIL: inbounds/list (curl_rc=$RC http=$HTTP)"
   echo "FAIL: Response: $LIST"
   exit 1
 fi
@@ -196,8 +208,9 @@ INB_ID="$(echo "$ARR" | jq -r --argjson i "$IDX" '.[$i].id')"
 
 # -------- get inbound --------
 INB="$(api_call GET "${PANEL_URL}/panel/api/inbounds/get/${INB_ID}")"
-if [[ "$API_RC" != "0" || "$API_HTTP" -lt 200 || "$API_HTTP" -ge 300 ]]; then
-  echo "FAIL: inbounds/get (curl_rc=$API_RC http=$API_HTTP)"
+HTTP="$(cat "$HTTP_FILE")"; RC="$(cat "$RC_FILE")"
+if [[ "$RC" != "0" || "$HTTP" -lt 200 || "$HTTP" -ge 300 ]]; then
+  echo "FAIL: inbounds/get (curl_rc=$RC http=$HTTP)"
   echo "FAIL: Response: $INB"
   exit 1
 fi
@@ -271,8 +284,8 @@ for b64 in "${CLIENTS[@]}"; do
   old_exp="$(echo "$c" | jq -r '.expiryTime // 0')"
   old_tot="$(echo "$c" | jq -r '.totalGB // 0')"
 
-  # Expire-within filter (if enabled):
-  # - if expiryTime == 0 (no-expiry), treat as NOT expiring soon => skip when WITHIN_DAYS>0
+  # Expire-within filter:
+  # If WITHIN_DAYS>0 and expiryTime==0 => not expiring => skip
   if (( WITHIN_DAYS > 0 )); then
     if (( old_exp == 0 )); then
       SKIPN=$((SKIPN+1)); DONE=$((DONE+1)); progress; continue
@@ -324,6 +337,7 @@ for b64 in "${CLIENTS[@]}"; do
 
   while true; do
     resp="$(api_call POST "${PANEL_URL}/panel/api/inbounds/updateClient/${client_id}" "$payload")"
+    HTTP="$(cat "$HTTP_FILE")"; RC="$(cat "$RC_FILE")"
     mt="$(json_msg "$resp")"
 
     if echo "$resp" | grep -qi "database is locked" || echo "$mt" | grep -qi "database is locked"; then
@@ -336,10 +350,10 @@ for b64 in "${CLIENTS[@]}"; do
       continue
     fi
 
-    if [[ "$API_RC" != "0" ]]; then
-      message="curl_rc=$API_RC"
-    elif [[ "$API_HTTP" -lt 200 || "$API_HTTP" -ge 300 ]]; then
-      message="http=$API_HTTP"
+    if [[ "$RC" != "0" ]]; then
+      message="curl_rc=$RC"
+    elif [[ "$HTTP" -lt 200 || "$HTTP" -ge 300 ]]; then
+      message="http=$HTTP"
     else
       if json_success "$resp"; then
         status="OK"
