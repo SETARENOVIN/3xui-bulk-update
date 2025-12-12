@@ -12,6 +12,10 @@ set -euo pipefail
 # - No CSV
 # - settings can be string OR object
 # - Auto retry/backoff on "database is locked"
+#
+# IMPORTANT FIX:
+# - Login success is determined by JSON success=true (NOT http_code),
+#   because some setups return body but curl reports http_code=000.
 # ==========================================================
 
 # -------- fixed defaults (not prompted) --------
@@ -74,9 +78,9 @@ trap 'rm -f "$COOKIE_JAR"; rm -rf "$TMP_DIR"' EXIT
 HTTP_FILE="$TMP_DIR/http"
 RC_FILE="$TMP_DIR/rc"
 
-# -------- HTTP wrapper (writes http/rc to temp files) --------
-api_call(){
-  # api_call METHOD URL [JSON_BODY]
+# -------- HTTP wrappers (write rc/http to files) --------
+api_call_follow(){
+  # api_call_follow METHOD URL [JSON_BODY]
   local method="$1" url="$2" body="${3:-}"
   local resp rc http
 
@@ -111,7 +115,32 @@ api_call(){
 
   echo "$http" > "$HTTP_FILE"
   echo "$rc"   > "$RC_FILE"
+  printf "%s" "$resp"
+}
 
+api_call_nofollow(){
+  # api_call_nofollow METHOD URL [JSON_BODY]
+  # Use for login to avoid weird redirect behavior that can yield http_code=000
+  local method="$1" url="$2" body="${3:-}"
+  local resp rc http
+
+  set +e
+  resp=$(curl -sS ${CURL_INSECURE:-} \
+    --retry "$CURL_RETRY" --retry-delay 1 --max-time "$CURL_TIMEOUT" \
+    -X "$method" \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -H "Content-Type: application/json" \
+    -d "$body" \
+    -w "\n%{http_code}" \
+    "$url")
+  rc=$?
+  set -e
+
+  http="${resp##*$'\n'}"
+  resp="${resp%$'\n'*}"
+
+  echo "$http" > "$HTTP_FILE"
+  echo "$rc"   > "$RC_FILE"
   printf "%s" "$resp"
 }
 
@@ -161,32 +190,28 @@ read_default "ONLY_ENABLED (y/n)" "y" ONLY_ENABLED
 read_default "EXPIRE_WITHIN_DAYS (0=all)" "0" WITHIN_DAYS
 read_default "EMAIL_REGEX (empty=all)" "" EMAIL_RE
 
-# -------- login (try /login and /login/) --------
+# -------- login (NOFOLLOW, trust success=true) --------
 LOGIN_PAYLOAD=$(jq -n --arg u "$USERNAME" --arg p "$PASSWORD" --arg tf "$TWOFA" \
   'if ($tf|length)>0 then {username:$u,password:$p,twoFactorCode:$tf} else {username:$u,password:$p} end')
 
 echo
 echo "INFO: Logging in..."
-BODY="$(api_call POST "${PANEL_URL}/login" "$LOGIN_PAYLOAD")"
-HTTP="$(cat "$HTTP_FILE")"; RC="$(cat "$RC_FILE")"
-if [[ "$RC" != "0" || "$HTTP" -lt 200 || "$HTTP" -ge 300 ]]; then
-  BODY="$(api_call POST "${PANEL_URL}/login/" "$LOGIN_PAYLOAD")"
-  HTTP="$(cat "$HTTP_FILE")"; RC="$(cat "$RC_FILE")"
+BODY="$(api_call_nofollow POST "${PANEL_URL}/login" "$LOGIN_PAYLOAD")"
+
+# Fallback to /login/ if needed
+if ! json_success "$BODY"; then
+  BODY="$(api_call_nofollow POST "${PANEL_URL}/login/" "$LOGIN_PAYLOAD")"
 fi
 
-# If body says success:true, treat as OK even if proxy gives odd code
-if ! { [[ "$RC" == "0" && "$HTTP" -ge 200 && "$HTTP" -lt 300 ]]; } ; then
-  if echo "$BODY" | jq -e '.success==true' >/dev/null 2>&1; then
-    echo "WARN: Login http/rc looked odd (rc=$RC http=$HTTP) but success=true. Continuing..."
-  else
-    echo "FAIL: Login failed (curl_rc=$RC http=$HTTP)"
-    echo "FAIL: Response: $BODY"
-    exit 1
-  fi
+if ! json_success "$BODY"; then
+  HTTP="$(cat "$HTTP_FILE")"; RC="$(cat "$RC_FILE")"
+  echo "FAIL: Login failed (curl_rc=$RC http=$HTTP)"
+  echo "FAIL: Response: $BODY"
+  exit 1
 fi
 
 # -------- list inbounds --------
-LIST="$(api_call GET "${PANEL_URL}/panel/api/inbounds/list")"
+LIST="$(api_call_follow GET "${PANEL_URL}/panel/api/inbounds/list")"
 HTTP="$(cat "$HTTP_FILE")"; RC="$(cat "$RC_FILE")"
 if [[ "$RC" != "0" || "$HTTP" -lt 200 || "$HTTP" -ge 300 ]]; then
   echo "FAIL: inbounds/list (curl_rc=$RC http=$HTTP)"
@@ -207,7 +232,7 @@ INB_ID="$(echo "$ARR" | jq -r --argjson i "$IDX" '.[$i].id')"
 [[ -n "$INB_ID" && "$INB_ID" != "null" ]] || { echo "Invalid inbound selection."; exit 1; }
 
 # -------- get inbound --------
-INB="$(api_call GET "${PANEL_URL}/panel/api/inbounds/get/${INB_ID}")"
+INB="$(api_call_follow GET "${PANEL_URL}/panel/api/inbounds/get/${INB_ID}")"
 HTTP="$(cat "$HTTP_FILE")"; RC="$(cat "$RC_FILE")"
 if [[ "$RC" != "0" || "$HTTP" -lt 200 || "$HTTP" -ge 300 ]]; then
   echo "FAIL: inbounds/get (curl_rc=$RC http=$HTTP)"
@@ -285,7 +310,6 @@ for b64 in "${CLIENTS[@]}"; do
   old_tot="$(echo "$c" | jq -r '.totalGB // 0')"
 
   # Expire-within filter:
-  # If WITHIN_DAYS>0 and expiryTime==0 => not expiring => skip
   if (( WITHIN_DAYS > 0 )); then
     if (( old_exp == 0 )); then
       SKIPN=$((SKIPN+1)); DONE=$((DONE+1)); progress; continue
@@ -336,7 +360,7 @@ for b64 in "${CLIENTS[@]}"; do
   message=""
 
   while true; do
-    resp="$(api_call POST "${PANEL_URL}/panel/api/inbounds/updateClient/${client_id}" "$payload")"
+    resp="$(api_call_follow POST "${PANEL_URL}/panel/api/inbounds/updateClient/${client_id}" "$payload")"
     HTTP="$(cat "$HTTP_FILE")"; RC="$(cat "$RC_FILE")"
     mt="$(json_msg "$resp")"
 
