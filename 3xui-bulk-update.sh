@@ -12,10 +12,7 @@ set -euo pipefail
 # - No CSV
 # - settings can be string OR object
 # - Auto retry/backoff on "database is locked"
-#
-# IMPORTANT FIX:
-# - Login success is determined by JSON success=true (NOT http_code),
-#   because some setups return body but curl reports http_code=000.
+# - Auto-install prerequisites (curl/jq/awk/base64/grep) if missing
 # ==========================================================
 
 # -------- fixed defaults (not prompted) --------
@@ -25,9 +22,119 @@ LOCK_RETRY_MAX=6
 LOCK_RETRY_BASE_SLEEP=1
 INSECURE_TLS_DEFAULT="y"
 
-# -------- deps --------
-need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
-need curl; need jq; need awk; need base64; need grep
+# -------- auto-install deps --------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
+
+run_as_root() {
+  if is_root; then
+    "$@"
+  elif have sudo; then
+    sudo "$@"
+  else
+    echo "ERROR: Missing sudo and not running as root. Please install dependencies manually."
+    return 1
+  fi
+}
+
+detect_pm() {
+  if have apt-get; then echo "apt"; return 0; fi
+  if have dnf; then echo "dnf"; return 0; fi
+  if have yum; then echo "yum"; return 0; fi
+  if have apk; then echo "apk"; return 0; fi
+  if have pacman; then echo "pacman"; return 0; fi
+  if have zypper; then echo "zypper"; return 0; fi
+  echo "unknown"
+}
+
+install_pkgs() {
+  local pm="$1"; shift
+  case "$pm" in
+    apt)
+      run_as_root apt-get update -y
+      run_as_root apt-get install -y "$@"
+      ;;
+    dnf)
+      run_as_root dnf install -y "$@"
+      ;;
+    yum)
+      run_as_root yum install -y "$@"
+      ;;
+    apk)
+      run_as_root apk add --no-cache "$@"
+      ;;
+    pacman)
+      run_as_root pacman -Sy --noconfirm "$@"
+      ;;
+    zypper)
+      run_as_root zypper --non-interactive install -y "$@"
+      ;;
+    *)
+      echo "ERROR: Unsupported package manager. Please install dependencies manually: curl jq awk base64 grep"
+      return 1
+      ;;
+  esac
+}
+
+ensure_deps() {
+  local missing_cmds=()
+  for c in curl jq awk base64 grep; do
+    have "$c" || missing_cmds+=("$c")
+  done
+
+  if [[ "${#missing_cmds[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  echo "INFO: Missing dependencies: ${missing_cmds[*]}"
+  local pm; pm="$(detect_pm)"
+  echo "INFO: Detected package manager: $pm"
+
+  # Map commands -> packages (best-effort)
+  local pkgs=()
+  for c in "${missing_cmds[@]}"; do
+    case "$c" in
+      curl)   pkgs+=("curl") ;;
+      jq)     pkgs+=("jq") ;;
+      awk)
+        # gawk is common name; on alpine it’s gawk too
+        pkgs+=("gawk")
+        ;;
+      base64)
+        # usually in coreutils
+        pkgs+=("coreutils")
+        ;;
+      grep)
+        pkgs+=("grep")
+        ;;
+    esac
+  done
+
+  # Deduplicate
+  local uniq_pkgs=()
+  for p in "${pkgs[@]}"; do
+    local seen=0
+    for u in "${uniq_pkgs[@]}"; do [[ "$u" == "$p" ]] && seen=1 && break; done
+    [[ "$seen" -eq 0 ]] && uniq_pkgs+=("$p")
+  done
+
+  echo "INFO: Installing packages: ${uniq_pkgs[*]}"
+  install_pkgs "$pm" "${uniq_pkgs[@]}"
+
+  # Re-check
+  for c in curl jq awk base64 grep; do
+    if ! have "$c"; then
+      echo "ERROR: Dependency still missing after install: $c"
+      exit 1
+    fi
+  done
+}
+
+ensure_deps
+
+# -------- deps now guaranteed --------
+# (no need for further checks)
 
 # -------- helpers --------
 read_required() {
@@ -78,9 +185,7 @@ trap 'rm -f "$COOKIE_JAR"; rm -rf "$TMP_DIR"' EXIT
 HTTP_FILE="$TMP_DIR/http"
 RC_FILE="$TMP_DIR/rc"
 
-# -------- HTTP wrappers (write rc/http to files) --------
 api_call_follow(){
-  # api_call_follow METHOD URL [JSON_BODY]
   local method="$1" url="$2" body="${3:-}"
   local resp rc http
 
@@ -89,12 +194,9 @@ api_call_follow(){
     resp=$(curl -sS ${CURL_INSECURE:-} \
       --location --max-redirs 5 --post301 --post302 --post303 \
       --retry "$CURL_RETRY" --retry-delay 1 --max-time "$CURL_TIMEOUT" \
-      -X "$method" \
-      -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
-      -H "Content-Type: application/json" \
-      -d "$body" \
-      -w "\n%{http_code}" \
-      "$url")
+      -X "$method" -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+      -H "Content-Type: application/json" -d "$body" \
+      -w "\n%{http_code}" "$url")
     rc=$?
     set -e
   else
@@ -102,10 +204,8 @@ api_call_follow(){
     resp=$(curl -sS ${CURL_INSECURE:-} \
       --location --max-redirs 5 --post301 --post302 --post303 \
       --retry "$CURL_RETRY" --retry-delay 1 --max-time "$CURL_TIMEOUT" \
-      -X "$method" \
-      -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
-      -w "\n%{http_code}" \
-      "$url")
+      -X "$method" -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+      -w "\n%{http_code}" "$url")
     rc=$?
     set -e
   fi
@@ -119,20 +219,15 @@ api_call_follow(){
 }
 
 api_call_nofollow(){
-  # api_call_nofollow METHOD URL [JSON_BODY]
-  # Use for login to avoid weird redirect behavior that can yield http_code=000
   local method="$1" url="$2" body="${3:-}"
   local resp rc http
 
   set +e
   resp=$(curl -sS ${CURL_INSECURE:-} \
     --retry "$CURL_RETRY" --retry-delay 1 --max-time "$CURL_TIMEOUT" \
-    -X "$method" \
-    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
-    -H "Content-Type: application/json" \
-    -d "$body" \
-    -w "\n%{http_code}" \
-    "$url")
+    -X "$method" -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -H "Content-Type: application/json" -d "$body" \
+    -w "\n%{http_code}" "$url")
   rc=$?
   set -e
 
@@ -197,15 +292,11 @@ LOGIN_PAYLOAD=$(jq -n --arg u "$USERNAME" --arg p "$PASSWORD" --arg tf "$TWOFA" 
 echo
 echo "INFO: Logging in..."
 BODY="$(api_call_nofollow POST "${PANEL_URL}/login" "$LOGIN_PAYLOAD")"
-
-# Fallback to /login/ if needed
 if ! json_success "$BODY"; then
   BODY="$(api_call_nofollow POST "${PANEL_URL}/login/" "$LOGIN_PAYLOAD")"
 fi
-
 if ! json_success "$BODY"; then
-  HTTP="$(cat "$HTTP_FILE")"; RC="$(cat "$RC_FILE")"
-  echo "FAIL: Login failed (curl_rc=$RC http=$HTTP)"
+  echo "FAIL: Login failed"
   echo "FAIL: Response: $BODY"
   exit 1
 fi
@@ -240,7 +331,6 @@ if [[ "$RC" != "0" || "$HTTP" -lt 200 || "$HTTP" -ge 300 ]]; then
   exit 1
 fi
 
-# Parse clients from settings (string OR object)
 mapfile -t CLIENTS < <(
   echo "$INB" | jq -r '
     .obj.settings
@@ -252,22 +342,14 @@ mapfile -t CLIENTS < <(
 TOTAL="${#CLIENTS[@]}"
 ((TOTAL>0)) || { echo "No clients in inbound."; exit 0; }
 
-# -------- derived --------
 NOW="$(now_ms)"
 ADDMS="$(ms_days "$ADD_DAYS")"
 ADDBYTES="$(bytes_gb "$ADD_GB")"
 WINMS="$(ms_days "$WITHIN_DAYS")"
 
-OKN=0
-SKIPN=0
-FAILN=0
-DONE=0
-
-ERROR_SAMPLE=()
-ERROR_SAMPLE_MAX=5
-
-START="$(date +%s)"
-LAST=0
+OKN=0; SKIPN=0; FAILN=0; DONE=0
+ERROR_SAMPLE=(); ERROR_SAMPLE_MAX=5
+START="$(date +%s)"; LAST=0
 
 progress(){
   local force="${1:-0}" now elapsed pct eta="--:--:--"
@@ -287,14 +369,12 @@ progress(){
 echo
 progress 1
 
-# -------- loop --------
 for b64 in "${CLIENTS[@]}"; do
   c="$(echo "$b64" | base64 -d)"
 
   email="$(echo "$c" | jq -r '.email // ""')"
   enable="$(echo "$c" | jq -r '.enable // true')"
 
-  # Filters
   if [[ "$ONLY_ENABLED" =~ ^[Yy]$ ]] && [[ "$enable" != "true" ]]; then
     SKIPN=$((SKIPN+1)); DONE=$((DONE+1)); progress; continue
   fi
@@ -309,7 +389,6 @@ for b64 in "${CLIENTS[@]}"; do
   old_exp="$(echo "$c" | jq -r '.expiryTime // 0')"
   old_tot="$(echo "$c" | jq -r '.totalGB // 0')"
 
-  # Expire-within filter:
   if (( WITHIN_DAYS > 0 )); then
     if (( old_exp == 0 )); then
       SKIPN=$((SKIPN+1)); DONE=$((DONE+1)); progress; continue
@@ -322,7 +401,6 @@ for b64 in "${CLIENTS[@]}"; do
   new_exp="$old_exp"
   new_tot="$old_tot"
 
-  # Apply expiry
   if [[ "$MODE" == "1" || "$MODE" == "3" ]]; then
     if (( old_exp == 0 )); then
       [[ "$NOEXP" == "setFromNow" ]] && new_exp=$((NOW + ADDMS))
@@ -331,7 +409,6 @@ for b64 in "${CLIENTS[@]}"; do
     fi
   fi
 
-  # Apply traffic
   if [[ "$MODE" == "2" || "$MODE" == "3" ]]; then
     if (( old_tot == 0 )); then
       [[ "$NOQUOTA" == "setLimit" ]] && new_tot="$ADDBYTES"
@@ -340,12 +417,10 @@ for b64 in "${CLIENTS[@]}"; do
     fi
   fi
 
-  # No change => skip
   if (( new_exp == old_exp && new_tot == old_tot )); then
     SKIPN=$((SKIPN+1)); DONE=$((DONE+1)); progress; continue
   fi
 
-  # Build updated client
   new_client="$c"
   (( new_exp != old_exp )) && new_client="$(echo "$new_client" | jq --argjson v "$new_exp" '.expiryTime=$v')"
   (( new_tot != old_tot )) && new_client="$(echo "$new_client" | jq --argjson v "$new_tot" '.totalGB=$v')"
@@ -354,7 +429,6 @@ for b64 in "${CLIENTS[@]}"; do
   settings_str="$(echo "$settings_obj" | jq -c '.')"
   payload="$(jq -n --argjson id "$INB_ID" --arg settings "$settings_str" '{id:$id,settings:$settings}')"
 
-  # Update with retry/backoff on database lock
   attempt=0
   status="FAIL"
   message=""
